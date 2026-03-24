@@ -1,0 +1,531 @@
+
+================================================================================
+CELL 0 [code]
+================================================================================
+from datetime import datetime
+import pandas as pd
+import numpy as np
+from read_db import Clickhouse
+
+
+client = Clickhouse(
+    database="default",
+    host="10.0.10.12",
+    port=8123,
+    username="read_only_user",
+    password="password",
+    readonly=True
+)
+
+# ======= 配置 =======
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+
+INDEX_CODE = "zz1000"         # "zz1000" / "hs300" / "zz500"
+H = 20                         # 未来H日累计对数收益
+START_DATE = datetime(2023, 1, 1)
+END_DATE   = datetime(2025, 6, 30)
+IND_LEVEL = "l1"               # "l1" / "l2" / "l3"
+
+# ======= 取数 =======
+is_trade_df = client.get('is_trade_day', START_DATE, END_DATE).sort_index()
+trade_days = is_trade_df.index
+
+close_df    = client.get('close_1d', START_DATE - timedelta(days=365), END_DATE).sort_index()
+weight_df   = client.get(f"{INDEX_CODE}_weight", START_DATE, END_DATE).sort_index()
+money_df    = client.get('money_1d', START_DATE - timedelta(days=120), END_DATE).sort_index()
+turnover_df = client.get('turnover_ratio_1d', START_DATE - timedelta(days=120), END_DATE).sort_index()
+
+ind_field = {"l1":"stock_industry_name_sw_l1","l2":"stock_industry_name_sw_l2","l3":"stock_industry_name_sw_l3"}[IND_LEVEL]
+industry_df = client.get(ind_field, START_DATE - timedelta(days=10), END_DATE).sort_index()
+
+# 结构/风格：指数收盘（小盘vs大盘 & 也用于TARGET指数的价格特征）
+index_close = client.get('index_close_1d', START_DATE - timedelta(days=365), END_DATE).sort_index()
+
+# 资金情绪：大/中/小/超大单、ETF成交额、自由流通市值
+inflow_xl = client.get('inflow_xl_money_1d', START_DATE - timedelta(days=10), END_DATE).sort_index()
+inflow_l  = client.get('inflow_l_money_1d',  START_DATE - timedelta(days=10), END_DATE).sort_index()
+inflow_m  = client.get('inflow_m_money_1d',  START_DATE - timedelta(days=10), END_DATE).sort_index()
+inflow_s  = client.get('inflow_s_money_1d',  START_DATE - timedelta(days=10), END_DATE).sort_index()
+etf_money = client.get('etf_money_1d',       START_DATE - timedelta(days=10), END_DATE).sort_index()
+free_mv   = client.get('free_market_cap_1d', START_DATE - timedelta(days=10), END_DATE).sort_index()
+
+# ======= 预处理/对齐 =======
+def _norm_cols(df):
+    if not isinstance(df, pd.DataFrame): return df
+    out = df.copy()
+    out.columns = [str(c).replace('.SZ','').replace('.SH','').replace('SZ','').replace('SH','') for c in out.columns]
+    return out
+
+# 对齐交易日
+close_df    = _norm_cols(close_df).reindex(trade_days).ffill().sort_index()
+money_df    = _norm_cols(money_df).reindex(trade_days).sort_index()
+turnover_df = _norm_cols(turnover_df).reindex(trade_days).sort_index()
+weight_df   = _norm_cols(weight_df).reindex(trade_days).fillna(0.0).sort_index()
+industry_df = _norm_cols(industry_df)
+
+index_close = index_close.reindex(trade_days)
+etf_money   = etf_money.reindex(trade_days)
+
+# inflow_* 可能是Series或DF
+def _to_series(x):
+    x = x.reindex(trade_days)
+    if isinstance(x, pd.DataFrame):
+        return x.sum(axis=1)
+    return x
+inflow_xl = _to_series(inflow_xl)
+inflow_l  = _to_series(inflow_l)
+inflow_m  = _to_series(inflow_m)
+inflow_s  = _to_series(inflow_s)
+free_mv   = _norm_cols(free_mv).reindex(trade_days)
+
+# 权重归一 & 成分掩码
+w_sum = weight_df.sum(axis=1).replace(0, np.nan)
+weight_df = weight_df.div(w_sum, axis=0).fillna(0.0)
+is_member = (weight_df > 0).astype(float)
+
+# ======= 标签：指数对数收益的未来H日累计 =======
+stock_logret = np.log(close_df).diff()
+index_logret = (weight_df * stock_logret).sum(axis=1).rename(f"{INDEX_CODE}_logret")
+label = index_logret.rolling(H).sum().shift(-H).rename(f"RET_{INDEX_CODE}_{H}d")
+
+# ======= 工具函数 =======
+def groupby_cols_sum(df, mapper):
+    try:    return df.groupby(mapper, axis=1).sum()
+    except: return df.T.groupby(mapper).sum().T
+
+def groupby_cols_count(df, mapper):
+    try:    return df.notna().groupby(mapper, axis=1).sum()
+    except: return df.notna().T.groupby(mapper).sum().T
+
+def groupby_cols_mean(df, mapper):
+    s = groupby_cols_sum(df, mapper); c = groupby_cols_count(df, mapper)
+    out = s / c
+    return out.replace([np.inf, -np.inf], np.nan)
+
+def rankic(x, y): return spearmanr(x, y, nan_policy="omit")[0]
+def hit(x, y):    return float((np.sign(x)*np.sign(y) > 0).mean())
+
+def evaluate_features(feat_df, label_series):
+    feat_std = (feat_df - feat_df.rolling(252, min_periods=60).mean()) / feat_df.rolling(252, min_periods=60).std()
+    df_eval = pd.concat([feat_df, label_series], axis=1).dropna()
+    df_eval_std = pd.concat([feat_std, label_series], axis=1).dropna()
+    rows = []
+    for col in feat_df.columns:
+        if col in df_eval.columns:
+            ic_raw = rankic(df_eval[col], df_eval[label_series.name])
+            hr_raw = hit(df_eval[col], df_eval[label_series.name])
+            n_obs  = int(df_eval[[col, label_series.name]].dropna().shape[0])
+        else:
+            ic_raw = hr_raw = np.nan; n_obs = 0
+        if col in df_eval_std.columns:
+            ic_std = rankic(df_eval_std[col], df_eval_std[label_series.name])
+            hr_std = hit(df_eval_std[col], df_eval_std[label_series.name])
+        else:
+            ic_std = hr_std = np.nan
+        rows.append({"feature":col,"label":label_series.name,"RankIC_raw":ic_raw,"HitRatio_raw":hr_raw,
+                     "RankIC_std":ic_std,"HitRatio_std":hr_std,"n_obs":n_obs})
+    return pd.DataFrame(rows).sort_values("RankIC_std", ascending=False)
+
+def _auto_pick(df, keys_list):
+    cols = [str(c).lower() for c in df.columns]
+    for keys in keys_list:
+        for i,c in enumerate(cols):
+            if all(k.lower() in c for k in keys):
+                return df.columns[i]
+    return None
+
+# ======= A. 量价类特征（含新增） =======
+# A1 20日波动率（指数logret）
+feat_vol_20d = index_logret.rolling(20, min_periods=10).std().rename("vp_volatility_20d")
+
+# A2 涨跌广度（当日成分上涨家数/成分数）
+is_adv = (close_df > close_df.shift(1)).astype(float)
+adv_count = (is_adv * is_member).sum(axis=1)
+member_count = is_member.sum(axis=1).replace(0, np.nan)
+feat_breadth = (adv_count / member_count).rename("vp_advance_breadth")
+
+# A3 行业成交集中度（max行业/总行业）
+if isinstance(industry_df, pd.DataFrame): ind_map = industry_df.ffill().iloc[-1]
+else:                                      ind_map = industry_df
+ind_map = ind_map.reindex(close_df.columns)
+money_use = money_df.fillna(0.0) * is_member
+money_by_ind = groupby_cols_sum(money_use, ind_map)
+ind_total = money_by_ind.sum(axis=1).replace(0, np.nan)
+ind_max   = money_by_ind.max(axis=1)
+feat_ind_conc = (ind_max / ind_total).rename(f"vp_industry_concentration_{IND_LEVEL}")
+
+# A4 成交额短长比（成分合计MA10/MA60）
+index_money = (money_use).sum(axis=1)
+feat_money_shortlong = (
+    index_money.rolling(10, min_periods=5).mean() /
+    index_money.rolling(60, min_periods=20).mean()
+).rename("vp_money_ma10_over_ma60")
+
+# A5 加权换手率
+to_use = turnover_df.copy()
+tmp_mean = to_use.stack().dropna().astype(float).mean() if to_use.size>0 else 0.0
+if tmp_mean > 1.0: to_use = to_use/100.0
+feat_turnover_mkt = (to_use * weight_df).sum(axis=1).rename("vp_turnover_weighted")
+
+# —— 新增：目标指数价格短长比 & 20日动量（取INDEX_CODE对应指数列）
+col_target = None
+if INDEX_CODE.lower() == "zz1000":
+    col_target = _auto_pick(index_close, [("000852",), ("zz1000",), ("csi1000",), ("中证1000",)])
+elif INDEX_CODE.lower() == "hs300":
+    col_target = _auto_pick(index_close, [("000300",), ("hs300",), ("csi300",), ("沪深300",)])
+elif INDEX_CODE.lower() == "zz500":
+    col_target = _auto_pick(index_close, [("000905",), ("zz500",), ("csi500",), ("中证500",)])
+
+if col_target is not None:
+    idx_price = index_close[col_target].astype(float)
+else:
+    # 若没找到列，就用组合价格近似（由权重×个股价格构造一个指数）
+    idx_price = (weight_df * close_df).sum(axis=1)
+
+feat_price_ma10_over_ma60 = (idx_price.rolling(10).mean() / idx_price.rolling(60).mean()).rename("vp_price_ma10_over_ma60")
+feat_momentum_20d = (idx_price / idx_price.shift(20) - 1.0).rename("vp_momentum_20d")
+
+features_A = pd.concat([
+    feat_vol_20d, feat_breadth, feat_ind_conc, 
+    feat_money_shortlong, feat_turnover_mkt,
+    feat_price_ma10_over_ma60, feat_momentum_20d   # << 新增两枚趋势
+], axis=1)
+
+summary_A  = evaluate_features(features_A, label)
+print("=== 量价类 summary ===")
+print(summary_A, "\n")
+
+# ======= B. 结构/风格类特征（含新增） =======
+# B1 小盘 vs 大盘（20日累计对数收益差）
+col_zz = _auto_pick(index_close, [("000852",), ("zz1000",), ("csi1000",), ("中证1000",)])
+col_300= _auto_pick(index_close, [("000300",), ("hs300",), ("csi300",), ("沪深300",)])
+if (col_zz is not None) and (col_300 is not None):
+    lr_zz = np.log(index_close[col_zz]).diff()
+    lr_300= np.log(index_close[col_300]).diff()
+    feat_small_vs_large = (lr_zz.rolling(20).sum() - lr_300.rolling(20).sum()).rename("vp_RS_small_vs_large_20d")
+else:
+    feat_small_vs_large = pd.Series(index=trade_days, dtype=float, name="vp_RS_small_vs_large_20d")
+
+# B2 行业轮动一致性（行业收益排序 vs 行业成交活跃排序 的 Spearman）
+stock_ret_1d = close_df.pct_change()
+ind_ret   = groupby_cols_mean(stock_ret_1d, ind_map)
+ind_money = groupby_cols_sum(money_use, ind_map)
+
+def spearman_daily(a: pd.Series, b: pd.Series) -> float:
+    a = a.dropna(); b = b.dropna()
+    idx = a.index.intersection(b.index)
+    if len(idx) < 5: return np.nan
+    return spearmanr(a.loc[idx], b.loc[idx], nan_policy="omit")[0]
+
+feat_ind_rotation_consistency = pd.Series(index=trade_days, dtype=float, name="vp_industry_rotation_consistency")
+for t in trade_days:
+    if t in ind_ret.index and t in ind_money.index:
+        r = ind_ret.loc[t]; m = ind_money.loc[t]
+        if isinstance(r, pd.Series) and isinstance(m, pd.Series):
+            feat_ind_rotation_consistency.loc[t] = spearman_daily(r, m)
+
+# B3 行业集中度波动率（20日std）——（你原有）
+ind_conc2 = (ind_money.max(axis=1) / ind_money.sum(axis=1).replace(0, np.nan))
+feat_ind_conc_vol = ind_conc2.rolling(20, min_periods=10).std().rename("vp_industry_concentration_vol_20d")
+
+# B4 市值风格集中度（Top20流通市值成交额占比）
+free_mv = _norm_cols(free_mv)
+mv_mean = free_mv.stack().dropna().astype(float).mean() if free_mv.size else np.nan
+if pd.notna(mv_mean) and mv_mean < 1e10:
+    free_mv = free_mv * 1e8
+common_cols = list(set(free_mv.columns) & set(money_df.columns))
+money_all2 = money_df.reindex(trade_days).fillna(0.0)
+
+feat_top20_cap_money_share = pd.Series(index=trade_days, dtype=float, name="vp_top20cap_money_share")
+for t in trade_days:
+    cap_t = free_mv.loc[t, common_cols].dropna() if t in free_mv.index else pd.Series(dtype=float)
+    if cap_t.empty: continue
+    top20 = cap_t.sort_values(ascending=False).head(20).index
+    total_money_t = money_all2.loc[t, common_cols].sum()
+    if total_money_t <= 0: continue
+    feat_top20_cap_money_share.loc[t] = money_all2.loc[t, top20].sum() / total_money_t
+
+# —— 新增：结构/拐点相关的4枚 —— #
+# B5 行业成交排序一致性（与前一日的Spearman，20日均值）
+def _rank_consistency(df):
+    rhos, prev = [], None
+    for idx, row in df.iterrows():
+        if prev is None:
+            rhos.append(np.nan)
+        else:
+            rhos.append(prev.rank().corr(row.rank(), method='spearman'))
+        prev = row
+    return pd.Series(rhos, index=df.index)
+
+# 行业相对成交额（用自由流通市值归一）：先聚合行业流通市值
+ind_cap = groupby_cols_sum((free_mv.reindex(trade_days).fillna(0.0)), ind_map).replace(0, np.nan)
+rel_turnover_ind = (ind_money / ind_cap).replace([np.inf,-np.inf], np.nan)
+
+feat_ind_turnover_consistency_20d = _rank_consistency(rel_turnover_ind).rolling(20, min_periods=10).mean().rename("vp_industry_turnover_consistency_20d")
+
+# B6 市场换手极值分数（Z）：Σ成交额/Σ自由流通市值
+total_free_mv = free_mv.sum(axis=1).replace(0, np.nan)
+total_money   = money_df.fillna(0.0).sum(axis=1)
+market_free_turnover = (total_money / total_free_mv).replace([np.inf,-np.inf], np.nan)
+feat_turnover_extreme_score = ((market_free_turnover - market_free_turnover.rolling(252, min_periods=60).mean())
+                               / market_free_turnover.rolling(252, min_periods=60).std()).rename("vp_turnover_extreme_score")
+
+# B7 强弱行业差（20日累计）
+ind_cum_20 = (1 + ind_ret).rolling(20, min_periods=10).apply(lambda x: np.prod(1+x)-1, raw=False)
+def _top_bottom_diff(row, k=3):
+    vals = row.dropna().sort_values()
+    if len(vals) < k*2: return np.nan
+    return vals.iloc[-k:].mean() - vals.iloc[:k].mean()
+feat_industry_leader_diff_20d = ind_cum_20.apply(_top_bottom_diff, axis=1).rename("vp_industry_leader_diff_20d")
+
+# B8 行业收益 vs 行业相对成交秩相关（5日均值）
+def _rho_series_on_date(idx):
+    if (idx not in ind_ret.index) or (idx not in rel_turnover_ind.index): return np.nan
+    a = ind_ret.loc[idx].rank()
+    b = rel_turnover_ind.loc[idx].rank()
+    return a.corr(b, method='spearman')
+rho_list = [ _rho_series_on_date(t) for t in trade_days ]
+feat_return_turnover_corr_5d = (pd.Series(rho_list, index=trade_days)
+                                .rolling(5, min_periods=3).mean()
+                                .rename("vp_return_turnover_corr_5d"))
+
+features_B = pd.concat([
+    feat_small_vs_large,
+    feat_ind_rotation_consistency,
+    feat_ind_conc_vol,
+    feat_top20_cap_money_share,
+    # 新增4枚：
+    feat_ind_turnover_consistency_20d,
+    feat_turnover_extreme_score,
+    feat_industry_leader_diff_20d,
+    feat_return_turnover_corr_5d
+], axis=1).dropna(how='all', axis=1)
+
+summary_B  = evaluate_features(features_B, label)
+print("=== 结构/风格类 summary ===")
+print(summary_B, "\n")
+
+# ======= C. 资金情绪类特征（含新增） =======
+# C1 主力流入占比（超大+大）/ 总流入，5日
+xl_in = _to_series(inflow_xl); l_in = _to_series(inflow_l); m_in = _to_series(inflow_m); s_in = _to_series(inflow_s)
+total_in = (xl_in + l_in + m_in + s_in).replace(0, np.nan)
+feat_big_inflow_share_5d = (
+    (xl_in.rolling(5).sum() + l_in.rolling(5).sum()) / (total_in.rolling(5).sum())
+).rename("vp_big_inflow_share_5d")
+
+# C2 主力相对散户 ((超大+大)-小)/总流入，5日
+feat_big_vs_small_5d = (
+    ((xl_in + l_in - s_in).rolling(5).sum()) / (total_in.rolling(5).sum())
+).rename("vp_big_vs_small_inflow_5d")
+
+# C3 ETF活跃度（ETF成交额/全市场成交额），5日
+etf_money_s = _to_series(etf_money)
+feat_etf_activity_share_5d = (
+    etf_money_s.rolling(5).sum() / index_money.rolling(5).sum().replace(0, np.nan)
+).rename("vp_etf_activity_share_5d")
+
+# C4 全市场自由流通换手率（Σ成交额/Σ自由流通市值），5日
+feat_market_free_turnover_5d = (
+    total_money.rolling(5).sum() / total_free_mv.rolling(5).sum().replace(0, np.nan)
+).rename("vp_market_free_turnover_5d")
+
+# —— 新增三枚情绪 —— #
+# C5 创业板成交占比（GEM: 300/301）
+gem_cols = [c for c in money_df.columns if str(c).startswith(("300","301"))]
+feat_gem_active_share_5d = ((money_df[gem_cols].sum(axis=1) / index_money)
+                            .rolling(5, min_periods=3).mean()
+                            .rename("vp_gem_active_share_5d")) if len(gem_cols)>0 else pd.Series(index=trade_days, dtype=float, name="vp_gem_active_share_5d")
+
+# C6 成交额波动率（20日）
+feat_turnover_vol_20d = (index_money.pct_change().rolling(20, min_periods=10).std()
+                         .rename("vp_turnover_vol_20d"))
+
+# C7 行业涨幅分歧（5日：行业均值收益的标准差）
+feat_industry_dispersion_5d = (ind_ret.rolling(5, min_periods=3).mean().std(axis=1)
+                               .rename("vp_industry_dispersion_5d"))
+
+features_C = pd.concat([
+    feat_big_inflow_share_5d,
+    feat_big_vs_small_5d,
+    feat_etf_activity_share_5d,
+    feat_market_free_turnover_5d,
+    # 新增三枚：
+    feat_gem_active_share_5d,
+    feat_turnover_vol_20d,
+    feat_industry_dispersion_5d
+], axis=1)
+
+summary_C  = evaluate_features(features_C, label)
+print("=== 资金情绪类 summary ===")
+print(summary_C, "\n")
+
+# ======= 合并总表（带类别） =======
+summary_A["bucket"] = "量价类"
+summary_B["bucket"] = "风格结构类"
+summary_C["bucket"] = "资金情绪类"
+summary_all = pd.concat([summary_A, summary_B, summary_C], axis=0, ignore_index=True).sort_values("RankIC_std", ascending=False)
+print("=== 合并总表 summary_all ===")
+print(summary_all)
+
+
+================================================================================
+CELL 1 [code]
+================================================================================
+# ========= 保存特征到 Parquet（宽表 + 长表 + 元数据） =========
+import os, json, hashlib
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# ---- 1) 组合特征：把 A/B/C 拼一起并附上 bucket 信息 ----
+# 先拿出 A/B/C 的列名集合
+cols_A = list(features_A.columns)
+cols_B = list(features_B.columns)
+cols_C = list(features_C.columns)
+
+# 合并为总特征表（时间索引 × 所有特征列）
+features_all = pd.concat([features_A, features_B, features_C], axis=1)
+# 统一排序并压到 float32 省空间
+features_all = features_all.sort_index().astype("float32")
+
+# 给每个特征列一个所属类别（bucket）映射，便于元数据和长表
+bucket_map = {c:"量价类" for c in cols_A}
+bucket_map.update({c:"风格结构类" for c in cols_B})
+bucket_map.update({c:"资金情绪类" for c in cols_C})
+
+# Label 也一起保存，便于训练/回测直接读取
+label_series = label.astype("float32")
+
+# ---- 2) 输出路径与版本信息 ----
+BASE_DIR = f"./feature_store/{INDEX_CODE}_H{H}_{IND_LEVEL}"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+# 版本号（随时间戳/脚本签名生成，便于回溯）
+def _code_signature():
+    # 用部分关键代码和列名计算签名，替代复杂的 git hash
+    key = "".join(list(features_all.columns)) + str(H) + INDEX_CODE + IND_LEVEL
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
+
+VERSION = datetime.now().strftime("%Y%m%d") + "_" + _code_signature()
+
+# 文件名
+PATH_WIDE  = os.path.join(BASE_DIR, f"features_wide_v{VERSION}.parquet")
+PATH_LONG  = os.path.join(BASE_DIR, f"features_long_v{VERSION}.parquet")
+PATH_LABEL = os.path.join(BASE_DIR, f"label_v{VERSION}.parquet")
+PATH_META  = os.path.join(BASE_DIR, f"meta_v{VERSION}.json")
+
+# ---- 3) 宽表保存（index=日期，columns=特征名）----
+# 为了更稳妥，和 label 对齐保存一份（不强制对齐到交集，只保留各自索引）
+features_all.to_parquet(PATH_WIDE, engine="pyarrow", compression="zstd", coerce_timestamps="ms")
+label_series.to_frame().to_parquet(PATH_LABEL, engine="pyarrow", compression="zstd", coerce_timestamps="ms")
+
+# ---- 4) 长表保存（更利于增量与筛选）----
+# 形如：date | feature | value | bucket | index_code | ind_level | year | month
+long_df = (
+    features_all
+    .stack(dropna=False)
+    .rename("value")
+    .reset_index()
+    .rename(columns={"level_0":"date", "level_1":"feature"})
+)
+long_df["bucket"]     = long_df["feature"].map(bucket_map).fillna("unknown")
+long_df["index_code"] = INDEX_CODE
+long_df["ind_level"]  = IND_LEVEL
+long_df["year"]       = long_df["date"].dt.year.astype("int16")
+long_df["month"]      = long_df["date"].dt.month.astype("int8")
+long_df["value"]      = long_df["value"].astype("float32")
+
+# 注意：pandas.to_parquet 本身不带 partition_cols 参数（需要 pyarrow.dataset）。
+# 为简便，我们这里直接存成单文件长表。如果以后想按年/月分区，可改成 pyarrow.dataset 写法。
+long_df.to_parquet(PATH_LONG, engine="pyarrow", compression="zstd", coerce_timestamps="ms", index=False)
+
+# ---- 5) 元数据 JSON：方便之后快速了解库里有什么 ----
+meta = {
+    "created_at": datetime.now().isoformat(timespec="seconds"),
+    "version": VERSION,
+    "index_code": INDEX_CODE,
+    "ind_level": IND_LEVEL,
+    "horizon_days": H,
+    "n_dates": int(features_all.shape[0]),
+    "n_features": int(features_all.shape[1]),
+    "features_by_bucket": {
+        "量价类": cols_A,
+        "风格结构类": cols_B,
+        "资金情绪类": cols_C
+    },
+    "files": {
+        "wide": PATH_WIDE,
+        "long": PATH_LONG,
+        "label": PATH_LABEL
+    }
+}
+with open(PATH_META, "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+
+print(f"[OK] 特征库已保存：\n- 宽表:   {PATH_WIDE}\n- 长表:   {PATH_LONG}\n- 标签:   {PATH_LABEL}\n- 元数据: {PATH_META}")
+
+# ---- 6) 读取工具函数（给你后续脚本直接用）----
+def load_features_wide(index_code: str, ind_level: str, version: str=None, base_dir: str="./feature_store"):
+    """
+    读取最新/指定版本的宽表与标签。
+    返回：features_wide(DataFrame), label(Series), meta(dict)
+    """
+    root = f"{base_dir}/{index_code}_H{H}_{ind_level}"
+    # 自动挑最新版本
+    if version is None:
+        # 找 meta_v*.json 中按时间排序最新的
+        metas = [p for p in os.listdir(root) if p.startswith("meta_v") and p.endswith(".json")]
+        if not metas:
+            raise FileNotFoundError("未找到元数据文件，确认路径是否正确")
+        metas.sort()
+        meta_path = os.path.join(root, metas[-1])
+    else:
+        meta_path = os.path.join(root, f"meta_v{version}.json")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    df_wide  = pd.read_parquet(meta["files"]["wide"], engine="pyarrow")
+    df_label = pd.read_parquet(meta["files"]["label"], engine="pyarrow").iloc[:,0]  # 取第一列转为 Series
+    df_wide.index = pd.to_datetime(df_wide.index)
+    df_label.index = pd.to_datetime(df_label.index)
+    return df_wide, df_label, meta
+
+def load_features_long(index_code: str, ind_level: str, version: str=None, base_dir: str="./feature_store",
+                       feature_list=None, start=None, end=None, bucket=None):
+    """
+    读取最新/指定版本的长表，可筛选 feature_list / 日期区间 / bucket。
+    返回：DataFrame[date, feature, value, bucket, index_code, ind_level, year, month]
+    """
+    root = f"{base_dir}/{index_code}_H{H}_{ind_level}"
+    if version is None:
+        metas = [p for p in os.listdir(root) if p.startswith("meta_v") and p.endswith(".json")]
+        if not metas:
+            raise FileNotFoundError("未找到元数据文件，确认路径是否正确")
+        metas.sort()
+        meta_path = os.path.join(root, metas[-1])
+    else:
+        meta_path = os.path.join(root, f"meta_v{version}.json")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    df_long = pd.read_parquet(meta["files"]["long"], engine="pyarrow")
+    # 过滤条件
+    if feature_list is not None:
+        df_long = df_long[df_long["feature"].isin(feature_list)]
+    if bucket is not None:
+        df_long = df_long[df_long["bucket"].isin([bucket] if isinstance(bucket, str) else list(bucket))]
+    if start is not None:
+        df_long = df_long[df_long["date"] >= pd.to_datetime(start)]
+    if end is not None:
+        df_long = df_long[df_long["date"] <= pd.to_datetime(end)]
+    return df_long.reset_index(drop=True)
+
+print("\n[Tips] 使用示例：")
+print("wide_df, y, meta = load_features_wide(INDEX_CODE, IND_LEVEL)")
+print("long_df = load_features_long(INDEX_CODE, IND_LEVEL, feature_list=['vp_momentum_20d'], start='2024-01-01')")
+
