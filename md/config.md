@@ -31,6 +31,10 @@
 - 含义：配置文件中使用的连接配置键名。
 - 如何生效：默认读取 `settings[db_settings_key]` 作为连接参数字典。
 
+### `use_macro_features`
+- 含义：是否使用宏观因子参与 Ridge 训练。
+- 如何生效：`True` 时用 `22 + market + macro`，`False` 时仅用 `22 + market`。
+
 ### `path_22`
 - 含义：22个 `vp_*` 因子 parquet 路径。
 - 如何生效：作为 Ridge 特征的一部分。
@@ -310,6 +314,7 @@ cfg.data.start_date = datetime(2022, 1, 1)
 cfg.data.end_date = datetime(2025, 6, 30)
 cfg.data.db_settings_path = "/home/quant/projects/timing/data/db_settings.json"
 cfg.data.db_settings_key = "clickhouse_read"
+cfg.data.use_macro_features = False  # 不用宏观时改为 False
 
 # Ridge
 cfg.ridge.cv_metric = "rankic"        # or "mse"

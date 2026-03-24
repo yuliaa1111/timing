@@ -43,6 +43,7 @@ class DataConfig:
     end_date: datetime = datetime(2025, 6, 30)
     db_settings_path: str = str(DATA_DIR / "db_settings.json")
     db_settings_key: str = "clickhouse_read"
+    use_macro_features: bool = True
     path_22: str = str(DATA_DIR / "features_ABC_zz1000_20230101_20250630.parquet")
     path_35: str = str(DATA_DIR / "market_indicators_20200101_20241231_20251109_132634.parquet")
     path_macro: str = str(DATA_DIR / "macro_2014_2026.parquet")
@@ -372,6 +373,7 @@ def write_results_md(
         f"- run_id: `{run_name}`",
         f"- created_at: `{datetime.now().isoformat(timespec='seconds')}`",
         f"- index_code: `{cfg.data.index_code}`",
+        f"- use_macro_features: `{cfg.data.use_macro_features}`",
         f"- bt_window: `{cfg.strategy.bt_start}` ~ `{cfg.strategy.bt_end}`",
         "",
         "## Backtest Metrics",
@@ -557,7 +559,7 @@ def build_ridge_composite_score(
     y_target: pd.Series,
     cfg: RidgeConfig,
     logger: logging.Logger | None = None,
-) -> tuple[pd.Series, pd.DataFrame]:
+) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     _validate_ridge_config(cfg)
 
     x_all = x_all.copy().sort_index()
@@ -565,6 +567,7 @@ def build_ridge_composite_score(
 
     score_raw = pd.Series(index=x_all.index, dtype=float, name="score_ridge_raw")
     rows = []
+    coef_rows = []
 
     start_pred_i = cfg.outer_train_window - 1 + cfg.label_availability_lag
     n = len(x_all)
@@ -618,6 +621,9 @@ def build_ridge_composite_score(
                 "used_folds": int(used_folds),
             }
         )
+        coef_row = {"pred_date": x_all.index[pred_i]}
+        coef_row.update({col: float(val) for col, val in zip(x_all.columns, model.coef_)})
+        coef_rows.append(coef_row)
 
         if logger is not None and len(rows) % 50 == 0:
             logger.info("ridge progress: done=%d latest_pred_date=%s", len(rows), x_all.index[pred_i])
@@ -630,6 +636,11 @@ def build_ridge_composite_score(
     composite_score.name = "composite_score"
 
     diag = pd.DataFrame(rows)
+    if len(coef_rows) > 0:
+        coef_df = pd.DataFrame(coef_rows).set_index("pred_date").sort_index()
+    else:
+        coef_df = pd.DataFrame(columns=x_all.columns)
+        coef_df.index.name = "pred_date"
     if logger is not None:
         logger.info(
             "ridge complete: total_outer=%d trained=%d skipped=%d",
@@ -637,7 +648,7 @@ def build_ridge_composite_score(
             len(diag),
             skipped_outer,
         )
-    return composite_score, diag
+    return composite_score, diag, coef_df
 
 
 # =========================
@@ -1065,17 +1076,26 @@ def run_timing_ridge(cfg: AppConfig):
     market_cols = [c for c in feature_df_35_num.columns if c.startswith("market_")]
     feature_df_35 = feature_df_35_num[market_cols].copy()
 
-    df_macro = ensure_datetime_index(pd.read_parquet(cfg.data.path_macro), "macro特征")
-    feature_df_macro = df_macro.select_dtypes(include=[np.number]).copy()
-
-    # 合并后对齐到 idx（同 final_timing 的处理风格）
-    x_all = (
-        feature_df_22.join(feature_df_35, how="inner")
-        .join(feature_df_macro, how="inner")
-        .sort_index()
-        .reindex(idx)
-        .ffill()
-    )
+    if cfg.data.use_macro_features:
+        df_macro = ensure_datetime_index(pd.read_parquet(cfg.data.path_macro), "macro特征")
+        feature_df_macro = df_macro.select_dtypes(include=[np.number]).copy()
+        x_all = (
+            feature_df_22.join(feature_df_35, how="inner")
+            .join(feature_df_macro, how="inner")
+            .sort_index()
+            .reindex(idx)
+            .ffill()
+        )
+        n_macro_cols = int(feature_df_macro.shape[1])
+    else:
+        feature_df_macro = pd.DataFrame(index=feature_df_22.index)
+        x_all = (
+            feature_df_22.join(feature_df_35, how="inner")
+            .sort_index()
+            .reindex(idx)
+            .ffill()
+        )
+        n_macro_cols = 0
 
     logger.info(
         "X_all ready shape=%s range=%s->%s cols_22=%d cols_market=%d cols_macro=%d",
@@ -1084,7 +1104,7 @@ def run_timing_ridge(cfg: AppConfig):
         x_all.index.max(),
         feature_df_22.shape[1],
         feature_df_35.shape[1],
-        feature_df_macro.shape[1],
+        n_macro_cols,
     )
     miss_col = x_all.isna().mean().sort_values(ascending=False).head(10)
     logger.info("X_all top missing ratios:\n%s", miss_col)
@@ -1092,13 +1112,18 @@ def run_timing_ridge(cfg: AppConfig):
     # ===== 3) Build y and ridge composite score =====
     logger.info("step 3/5: training walk-forward ridge and building composite_score")
     y_target = compute_target_y(index_open.reindex(idx), mode=cfg.target.y_mode)
-    composite_score, ridge_diag = build_ridge_composite_score(x_all, y_target, cfg.ridge, logger=logger)
+    composite_score, ridge_diag, ridge_coef = build_ridge_composite_score(
+        x_all, y_target, cfg.ridge, logger=logger
+    )
 
     logger.info("composite_score ready non_na=%d", int(composite_score.notna().sum()))
     if len(ridge_diag) > 0:
         logger.info("ridge windows=%d", len(ridge_diag))
         logger.info("alpha usage:\n%s", ridge_diag["best_alpha"].value_counts().sort_index())
         logger.info("latest windows:\n%s", ridge_diag.tail(5))
+    if len(ridge_coef) > 0:
+        top_mean_abs = ridge_coef.abs().mean().sort_values(ascending=False).head(20)
+        logger.info("top mean-abs ridge coefficients:\n%s", top_mean_abs)
 
     # ===== 4) Original downstream logic unchanged =====
     logger.info("step 4/5: running downstream position pipeline")
@@ -1216,6 +1241,22 @@ def run_timing_ridge(cfg: AppConfig):
     ridge_diag.to_csv(p, index=False, encoding="utf-8-sig")
     file_manifest["ridge_diag_csv"] = str(p)
 
+    p = run_dir / "ridge_coef_by_window.parquet"
+    ridge_coef.to_parquet(p, compression=cfg.output.parquet_compression)
+    file_manifest["ridge_coef_by_window_parquet"] = str(p)
+
+    coef_summary = pd.DataFrame(
+        {
+            "coef_mean": ridge_coef.mean(axis=0),
+            "coef_abs_mean": ridge_coef.abs().mean(axis=0),
+            "coef_std": ridge_coef.std(axis=0),
+            "coef_last": ridge_coef.iloc[-1] if len(ridge_coef) > 0 else np.nan,
+        }
+    ).sort_values("coef_abs_mean", ascending=False)
+    p = run_dir / "ridge_coef_summary.csv"
+    coef_summary.to_csv(p, encoding="utf-8-sig")
+    file_manifest["ridge_coef_summary_csv"] = str(p)
+
     p = run_dir / "series_composite_score.parquet"
     save_series_to_parquet(composite_score.rename("composite_score"), p, compression=cfg.output.parquet_compression)
     file_manifest["series_composite_score_parquet"] = str(p)
@@ -1290,6 +1331,8 @@ def run_timing_ridge(cfg: AppConfig):
         "date_range_data": [str(idx.min()), str(idx.max())],
         "date_range_bt": [cfg.strategy.bt_start, cfg.strategy.bt_end],
         "x_all_shape": [int(x_all.shape[0]), int(x_all.shape[1])],
+        "use_macro_features": bool(cfg.data.use_macro_features),
+        "n_macro_cols_used": int(n_macro_cols),
         "ridge_windows": int(len(ridge_diag)),
         "full_share_bt": full_share_bt,
         "fast_share_bt": fast_share_bt,
@@ -1332,6 +1375,7 @@ def run_timing_ridge(cfg: AppConfig):
         "x_all": x_all,
         "y_target": y_target,
         "ridge_diag": ridge_diag,
+        "ridge_coef": ridge_coef,
         "composite_score": composite_score,
         "attack_B": attack_B,
         "pos_target": pos_target,
