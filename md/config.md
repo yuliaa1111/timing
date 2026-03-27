@@ -248,10 +248,32 @@
 
 ## 4. TargetConfig
 
-### `y_mode`
-- 含义：训练目标定义。
-- 当前支持：`"open_t2_over_t1_minus1"`。
-- 如何生效：`y_t = (open_{t+2} / open_{t+1}) - 1`。
+### `price_source`
+- 含义：目标收益使用的价格口径。
+- 可选：`"open"` / `"close"`。
+- 如何生效：选择用开盘价序列或收盘价序列构造训练标签。
+
+### `return_type`
+- 含义：标签收益类型。
+- 可选：`"simple"` / `"log"`。
+- 如何生效：
+- `simple`：`p2 / p1 - 1`
+- `log`：`log(p2 / p1)`
+
+### `forward_start`
+- 含义：标签收益分母对应的前瞻偏移（单位：交易日）。
+- 如何生效：使用 `price.shift(-forward_start)` 作为 `p1`。
+
+### `forward_end`
+- 含义：标签收益分子对应的前瞻偏移（单位：交易日）。
+- 如何生效：使用 `price.shift(-forward_end)` 作为 `p2`。
+- 约束：`forward_end > forward_start`。
+
+示例：
+- `price_source="open", return_type="simple", forward_start=1, forward_end=2`
+  对应 `y_t = open_{t+2}/open_{t+1} - 1`
+- `price_source="close", return_type="log", forward_start=0, forward_end=1`
+  对应 `y_t = log(close_{t+1}/close_t)`
 
 ---
 
@@ -331,6 +353,12 @@ cfg.strategy.attack_q = 0.7
 cfg.strategy.attack_risk_th = -0.05
 cfg.strategy.money_z_win = 120
 
+# target (与 lag 独立配置)
+cfg.target.price_source = "open"     # or "close"
+cfg.target.return_type = "simple"    # or "log"
+cfg.target.forward_start = 1
+cfg.target.forward_end = 2
+
 # output
 cfg.output.run_root = "/home/quant/projects/timing/runs/timing_ridge"
 cfg.output.run_name = None
@@ -340,4 +368,26 @@ cfg.output.show_plots = False
 cfg.output.save_results_md = True
 
 out = run_timing_ridge(cfg)
+```
+
+---
+
+## 8. 命令行指定产物目录名
+
+可直接在运行时指定 run 名称，例如：
+
+```bash
+python timing_ridge.py --run-name exp001
+```
+
+产物会写到：
+
+```text
+<run_root>/exp001/
+```
+
+也可以同时指定根目录：
+
+```bash
+python timing_ridge.py --run-name exp001 --run-root /home/quant/projects/timing/runs/timing_ridge
 ```

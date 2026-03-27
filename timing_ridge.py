@@ -14,12 +14,13 @@ double-loop ridge engine:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -132,14 +133,17 @@ class StrategyConfig:
 
 @dataclass
 class TargetConfig:
-    # y_t = (open_{t+2}/open_{t+1}) - 1
-    y_mode: str = "open_t2_over_t1_minus1"
+    # label is independently configured by price source + forward window + return type
+    price_source: str = "open"  # open | close
+    return_type: str = "simple"  # simple | log
+    forward_start: int = 1
+    forward_end: int = 2
 
 
 @dataclass
 class OutputConfig:
     run_root: str = str(RUNS_DIR)
-    run_name: str | None = None
+    run_name: Optional[str] = None
     save_big_files: bool = True
     save_plots: bool = True
     show_plots: bool = False
@@ -530,12 +534,39 @@ def select_best_alpha_with_time_cv(
 # =========================
 # Ridge composite score
 # =========================
-def compute_target_y(index_open: pd.Series, mode: str) -> pd.Series:
-    idx_open = index_open.astype(float).copy()
-    if mode == "open_t2_over_t1_minus1":
-        y = idx_open.shift(-2) / idx_open.shift(-1) - 1.0
-        return y.rename("y_open_t2_over_t1_minus1")
-    raise ValueError(f"Unsupported y_mode: {mode}")
+def compute_target_y(
+    index_open: pd.Series,
+    index_close: pd.Series,
+    cfg: TargetConfig,
+) -> pd.Series:
+    source = cfg.price_source.lower().strip()
+    ret_type = cfg.return_type.lower().strip()
+    s = int(cfg.forward_start)
+    e = int(cfg.forward_end)
+
+    if source == "open":
+        price = index_open.astype(float).copy()
+    elif source == "close":
+        price = index_close.astype(float).copy()
+    else:
+        raise ValueError("TargetConfig.price_source must be one of {'open','close'}")
+
+    if e <= s:
+        raise ValueError("TargetConfig.forward_end must be > forward_start")
+    if s < 0:
+        raise ValueError("TargetConfig.forward_start must be >= 0")
+
+    p1 = price.shift(-s)
+    p2 = price.shift(-e)
+    if ret_type == "simple":
+        y = p2 / p1 - 1.0
+    elif ret_type == "log":
+        y = np.log(p2 / p1)
+    else:
+        raise ValueError("TargetConfig.return_type must be one of {'simple','log'}")
+
+    name = f"y_{source}_t{e}_over_t{s}_{ret_type}"
+    return y.rename(name)
 
 
 def transform_score(raw_score: pd.Series, cfg: RidgeConfig) -> pd.Series:
@@ -1111,7 +1142,11 @@ def run_timing_ridge(cfg: AppConfig):
 
     # ===== 3) Build y and ridge composite score =====
     logger.info("step 3/5: training walk-forward ridge and building composite_score")
-    y_target = compute_target_y(index_open.reindex(idx), mode=cfg.target.y_mode)
+    y_target = compute_target_y(
+        index_open=index_open.reindex(idx),
+        index_close=index_close.reindex(idx),
+        cfg=cfg.target,
+    )
     composite_score, ridge_diag, ridge_coef = build_ridge_composite_score(
         x_all, y_target, cfg.ridge, logger=logger
     )
@@ -1389,5 +1424,18 @@ def run_timing_ridge(cfg: AppConfig):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run timing ridge pipeline")
+    parser.add_argument("--run-name", type=str, default=None, help="Custom run folder name, e.g. exp001")
+    parser.add_argument("--run-root", type=str, default=None, help="Custom run root folder path")
+    parser.add_argument("--no-macro", action="store_true", help="Disable macro features")
+    args = parser.parse_args()
+
     app_cfg = AppConfig()
+    if args.run_name is not None:
+        app_cfg.output.run_name = args.run_name
+    if args.run_root is not None:
+        app_cfg.output.run_root = args.run_root
+    if args.no_macro:
+        app_cfg.data.use_macro_features = False
+
     _ = run_timing_ridge(app_cfg)
